@@ -132,6 +132,16 @@ public:
     return solvetype;
   }
 
+  inline void SetMaxTime(double _maxtime)
+  {
+    maxtime = std::chrono::duration<double>(_maxtime);
+  }
+
+  inline double GetMaxTime() const
+  {
+    return maxtime.count();
+  }
+
 private:
   bool initialized;
   KDL::Chain chain;
