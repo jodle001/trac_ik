@@ -1,54 +1,73 @@
-cmake_minimum_required(VERSION 2.8.3)
+cmake_minimum_required(VERSION 3.5)
 project(trac_ik_kinematics_plugin)
 
-if(CMAKE_COMPILER_IS_GNUCXX OR ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang"))
-    set(CMAKE_CXX_FLAGS "-std=c++0x ${CMAKE_CXX_FLAGS}")
+if(NOT CMAKE_CXX_STANDARD)
+  set(CMAKE_CXX_STANDARD 17)
 endif()
 
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(pkg_nlopt REQUIRED nlopt)
+if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  add_compile_options(-Wall -Wextra -Wpedantic)
+endif()
 
-find_package(catkin REQUIRED
-  COMPONENTS
-    moveit_core
-    pluginlib
-    roscpp
-    tf_conversions
-    trac_ik_lib
-)
-
-include_directories(
-  include
-  ${catkin_INCLUDE_DIRS}
-  ${pkg_nlopt_INCLUDE_DIRS}
-)
-
-catkin_package(
-  INCLUDE_DIRS
-    include
-  CATKIN_DEPENDS
-    moveit_core
-    pluginlib
-    roscpp
-    tf_conversions
-    trac_ik_lib
-)
+find_package(ament_cmake REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(moveit_core REQUIRED)
+find_package(moveit_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(orocos_kdl REQUIRED)
+find_package(kdl_parser REQUIRED)
+find_package(urdf REQUIRED)
+find_package(pluginlib REQUIRED)
+find_package(trac_ik_lib REQUIRED)
 
 set(TRAC_IK_LIBRARY_NAME trac_ik_kinematics_plugin)
 
-add_library(${TRAC_IK_LIBRARY_NAME} src/trac_ik_kinematics_plugin.cpp)
-target_link_libraries(${TRAC_IK_LIBRARY_NAME} ${catkin_LIBRARIES} ${pkg_nlopt_LIBRARIES})
+add_library(${TRAC_IK_LIBRARY_NAME} SHARED src/trac_ik_kinematics_plugin.cpp)
 
-install(DIRECTORY include/
-  DESTINATION ${CATKIN_GLOBAL_INCLUDE_DESTINATION}
+target_include_directories(${TRAC_IK_LIBRARY_NAME}
+  PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
 )
 
-install(TARGETS ${TRAC_IK_LIBRARY_NAME}
-  LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION})
+ament_target_dependencies(${TRAC_IK_LIBRARY_NAME}
+  rclcpp
+  moveit_core
+  moveit_msgs
+  geometry_msgs
+  orocos_kdl
+  kdl_parser
+  urdf
+  pluginlib
+  trac_ik_lib
+)
+
+pluginlib_export_plugin_description_file(moveit_core trac_ik_kinematics_description.xml)
 
 install(
-  FILES
-    trac_ik_kinematics_description.xml
-  DESTINATION
-    ${CATKIN_PACKAGE_SHARE_DESTINATION}
+  DIRECTORY include/
+  DESTINATION include
 )
+
+install(
+  TARGETS ${TRAC_IK_LIBRARY_NAME}
+  EXPORT trac_ik_kinematics_pluginTargets
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION bin
+)
+
+ament_export_targets(trac_ik_kinematics_pluginTargets HAS_LIBRARY_TARGET)
+ament_export_dependencies(
+  rclcpp
+  moveit_core
+  moveit_msgs
+  geometry_msgs
+  orocos_kdl
+  kdl_parser
+  urdf
+  pluginlib
+  trac_ik_lib
+)
+
+ament_package()

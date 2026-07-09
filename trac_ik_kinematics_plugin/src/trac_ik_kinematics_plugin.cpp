@@ -28,137 +28,150 @@ OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISE
 OF THE POSSIBILITY OF SUCH DAMAGE.
 ********************************************************************************/
 
+// ROS 2 / MoveIt 2 port of the TRAC-IK MoveIt kinematics plugin.
 
-#include <ros/ros.h>
-#include <urdf/model.h>
-#include <tf_conversions/tf_kdl.h>
+#include <trac_ik/trac_ik_kinematics_plugin.hpp>
+
 #include <algorithm>
+#include <limits>
+#include <string>
+#include <vector>
+
+#include <kdl/chainfksolverpos_recursive.hpp>
 #include <kdl/tree.hpp>
 #include <kdl_parser/kdl_parser.hpp>
+#include <moveit/robot_model/robot_model.h>
 #include <trac_ik/trac_ik.hpp>
-#include <trac_ik/trac_ik_kinematics_plugin.hpp>
-#include <limits>
+#include <urdf/model.h>
 
 namespace trac_ik_kinematics_plugin
 {
 
-bool TRAC_IKKinematicsPlugin::initialize(const std::string &robot_description,
-    const std::string& group_name,
-    const std::string& base_name,
-    const std::string& tip_name,
-    double search_discretization)
+namespace
 {
-  std::vector<std::string> tip_names = {tip_name};
-  setValues(robot_description, group_name, base_name, tip_names, search_discretization);
+rclcpp::Logger getLogger()
+{
+  return rclcpp::get_logger("trac_ik_kinematics_plugin");
+}
 
-  ros::NodeHandle node_handle("~");
+KDL::Frame poseMsgToKDL(const geometry_msgs::msg::Pose& pose)
+{
+  return KDL::Frame(
+    KDL::Rotation::Quaternion(pose.orientation.x, pose.orientation.y,
+                              pose.orientation.z, pose.orientation.w),
+    KDL::Vector(pose.position.x, pose.position.y, pose.position.z));
+}
 
-  urdf::Model robot_model;
-  std::string xml_string;
+geometry_msgs::msg::Pose kdlToPoseMsg(const KDL::Frame& frame)
+{
+  geometry_msgs::msg::Pose pose;
+  pose.position.x = frame.p.x();
+  pose.position.y = frame.p.y();
+  pose.position.z = frame.p.z();
+  frame.M.GetQuaternion(pose.orientation.x, pose.orientation.y,
+                        pose.orientation.z, pose.orientation.w);
+  return pose;
+}
+}  // namespace
 
-  std::string urdf_xml, full_urdf_xml;
-  node_handle.param("urdf_xml", urdf_xml, robot_description);
-  node_handle.searchParam(urdf_xml, full_urdf_xml);
+bool TRAC_IKKinematicsPlugin::initialize(const rclcpp::Node::SharedPtr& node,
+                                         const moveit::core::RobotModel& robot_model,
+                                         const std::string& group_name,
+                                         const std::string& base_frame,
+                                         const std::vector<std::string>& tip_frames,
+                                         double search_discretization)
+{
+  node_ = node;
+  storeValues(robot_model, group_name, base_frame, tip_frames, search_discretization);
 
-  ROS_DEBUG_NAMED("trac_ik", "Reading xml file from parameter server");
-  if (!node_handle.getParam(full_urdf_xml, xml_string))
+  if (tip_frames.size() != 1)
   {
-    ROS_FATAL_NAMED("trac_ik", "Could not load the xml from parameter server: %s", urdf_xml.c_str());
+    RCLCPP_ERROR(getLogger(), "TRAC-IK supports exactly one tip frame; got %zu for group '%s'",
+                 tip_frames.size(), group_name.c_str());
     return false;
   }
 
-  node_handle.param(full_urdf_xml, xml_string, std::string());
-  robot_model.initString(xml_string);
-
-  ROS_DEBUG_STREAM_NAMED("trac_ik", "Reading joints and links from URDF");
+  const urdf::ModelInterfaceSharedPtr& robot_urdf = robot_model.getURDF();
+  if (!robot_urdf)
+  {
+    RCLCPP_ERROR(getLogger(), "Robot model has no URDF; cannot initialize TRAC-IK for group '%s'",
+                 group_name.c_str());
+    return false;
+  }
 
   KDL::Tree tree;
-
-  if (!kdl_parser::treeFromUrdfModel(robot_model, tree))
+  if (!kdl_parser::treeFromUrdfModel(*robot_urdf, tree))
   {
-    ROS_FATAL("Failed to extract kdl tree from xml robot description");
+    RCLCPP_ERROR(getLogger(), "Failed to extract KDL tree from the URDF robot description");
     return false;
   }
 
-  if (!tree.getChain(base_name, tip_name, chain))
+  if (!tree.getChain(base_frame_, tip_frames_[0], chain_))
   {
-    ROS_FATAL("Couldn't find chain %s to %s", base_name.c_str(), tip_name.c_str());
+    RCLCPP_ERROR(getLogger(), "Couldn't find KDL chain %s -> %s", base_frame_.c_str(),
+                 tip_frames_[0].c_str());
     return false;
   }
 
-  num_joints_ = chain.getNrOfJoints();
+  num_joints_ = chain_.getNrOfJoints();
 
-  std::vector<KDL::Segment> chain_segs = chain.segments;
+  joint_min_.resize(num_joints_);
+  joint_max_.resize(num_joints_);
 
-  urdf::JointConstSharedPtr joint;
-
-  std::vector<double> l_bounds, u_bounds;
-
-  joint_min.resize(num_joints_);
-  joint_max.resize(num_joints_);
-
-  uint joint_num = 0;
-  for (unsigned int i = 0; i < chain_segs.size(); ++i)
+  unsigned int joint_num = 0;
+  for (const KDL::Segment& segment : chain_.segments)
   {
+    link_names_.push_back(segment.getName());
 
-    link_names_.push_back(chain_segs[i].getName());
-    joint = robot_model.getJoint(chain_segs[i].getJoint().getName());
-    if (joint->type != urdf::Joint::UNKNOWN && joint->type != urdf::Joint::FIXED)
+    urdf::JointConstSharedPtr joint = robot_urdf->getJoint(segment.getJoint().getName());
+    if (!joint || joint->type == urdf::Joint::UNKNOWN || joint->type == urdf::Joint::FIXED)
     {
-      joint_num++;
-      assert(joint_num <= num_joints_);
-      float lower, upper;
-      int hasLimits;
-      joint_names_.push_back(joint->name);
-      if (joint->type != urdf::Joint::CONTINUOUS)
-      {
-        if (joint->safety)
-        {
-          lower = std::max(joint->limits->lower, joint->safety->soft_lower_limit);
-          upper = std::min(joint->limits->upper, joint->safety->soft_upper_limit);
-        }
-        else
-        {
-          lower = joint->limits->lower;
-          upper = joint->limits->upper;
-        }
-        hasLimits = 1;
-      }
-      else
-      {
-        hasLimits = 0;
-      }
-      if (hasLimits)
-      {
-        joint_min(joint_num - 1) = lower;
-        joint_max(joint_num - 1) = upper;
-      }
-      else
-      {
-        joint_min(joint_num - 1) = std::numeric_limits<float>::lowest();
-        joint_max(joint_num - 1) = std::numeric_limits<float>::max();
-      }
-      ROS_INFO_STREAM("IK Using joint " << chain_segs[i].getName() << " " << joint_min(joint_num - 1) << " " << joint_max(joint_num - 1));
+      continue;
     }
+
+    joint_num++;
+    joint_names_.push_back(joint->name);
+
+    double lower = std::numeric_limits<float>::lowest();
+    double upper = std::numeric_limits<float>::max();
+    if (joint->type != urdf::Joint::CONTINUOUS && joint->limits)
+    {
+      if (joint->safety)
+      {
+        lower = std::max(joint->limits->lower, joint->safety->soft_lower_limit);
+        upper = std::min(joint->limits->upper, joint->safety->soft_upper_limit);
+      }
+      else
+      {
+        lower = joint->limits->lower;
+        upper = joint->limits->upper;
+      }
+    }
+    joint_min_(joint_num - 1) = lower;
+    joint_max_(joint_num - 1) = upper;
+    RCLCPP_DEBUG(getLogger(), "IK using joint %s: [%g, %g]", joint->name.c_str(), lower, upper);
   }
 
-  ROS_INFO_NAMED("trac-ik plugin", "Looking in common namespaces for param name: %s", (group_name + "/position_only_ik").c_str());
-  lookupParam(group_name + "/position_only_ik", position_ik_, false);
-  ROS_INFO_NAMED("trac-ik plugin", "Looking in common namespaces for param name: %s", (group_name + "/solve_type").c_str());
-  lookupParam(group_name + "/solve_type", solve_type, std::string("Speed"));
-  ROS_INFO_NAMED("trac_ik plugin", "Using solve type %s", solve_type.c_str());
+  lookupParam(node_, "position_only_ik", position_ik_, false);
+  lookupParam(node_, "solve_type", solve_type_, std::string("Speed"));
+  lookupParam(node_, "epsilon", epsilon_, 1e-5);
+
+  RCLCPP_INFO(getLogger(),
+              "TRAC-IK ready for group '%s': chain %s -> %s (%u joints), "
+              "solve_type=%s, epsilon=%g, position_only_ik=%s",
+              group_name.c_str(), base_frame_.c_str(), tip_frames_[0].c_str(), num_joints_,
+              solve_type_.c_str(), epsilon_, position_ik_ ? "true" : "false");
 
   active_ = true;
   return true;
 }
 
-
-int TRAC_IKKinematicsPlugin::getKDLSegmentIndex(const std::string &name) const
+int TRAC_IKKinematicsPlugin::getKDLSegmentIndex(const std::string& name) const
 {
   int i = 0;
-  while (i < (int)chain.getNrOfSegments())
+  while (i < static_cast<int>(chain_.getNrOfSegments()))
   {
-    if (chain.getSegment(i).getName() == name)
+    if (chain_.getSegment(i).getName() == name)
     {
       return i + 1;
     }
@@ -167,26 +180,21 @@ int TRAC_IKKinematicsPlugin::getKDLSegmentIndex(const std::string &name) const
   return -1;
 }
 
-
-bool TRAC_IKKinematicsPlugin::getPositionFK(const std::vector<std::string> &link_names,
-    const std::vector<double> &joint_angles,
-    std::vector<geometry_msgs::Pose> &poses) const
+bool TRAC_IKKinematicsPlugin::getPositionFK(const std::vector<std::string>& link_names,
+                                            const std::vector<double>& joint_angles,
+                                            std::vector<geometry_msgs::msg::Pose>& poses) const
 {
   if (!active_)
   {
-    ROS_ERROR_NAMED("trac_ik", "kinematics not active");
+    RCLCPP_ERROR(getLogger(), "kinematics not active");
     return false;
   }
   poses.resize(link_names.size());
   if (joint_angles.size() != num_joints_)
   {
-    ROS_ERROR_NAMED("trac_ik", "Joint angles vector must have size: %d", num_joints_);
+    RCLCPP_ERROR(getLogger(), "Joint angles vector must have size: %u", num_joints_);
     return false;
   }
-
-  KDL::Frame p_out;
-  geometry_msgs::PoseStamped pose;
-  tf::Stamped<tf::Pose> tf_pose;
 
   KDL::JntArray jnt_pos_in(num_joints_);
   for (unsigned int i = 0; i < num_joints_; i++)
@@ -194,19 +202,19 @@ bool TRAC_IKKinematicsPlugin::getPositionFK(const std::vector<std::string> &link
     jnt_pos_in(i) = joint_angles[i];
   }
 
-  KDL::ChainFkSolverPos_recursive fk_solver(chain);
+  KDL::ChainFkSolverPos_recursive fk_solver(chain_);
 
   bool valid = true;
+  KDL::Frame p_out;
   for (unsigned int i = 0; i < poses.size(); i++)
   {
-    ROS_DEBUG_NAMED("trac_ik", "End effector index: %d", getKDLSegmentIndex(link_names[i]));
     if (fk_solver.JntToCart(jnt_pos_in, p_out, getKDLSegmentIndex(link_names[i])) >= 0)
     {
-      tf::poseKDLToMsg(p_out, poses[i]);
+      poses[i] = kdlToPoseMsg(p_out);
     }
     else
     {
-      ROS_ERROR_NAMED("trac_ik", "Could not compute FK for %s", link_names[i].c_str());
+      RCLCPP_ERROR(getLogger(), "Could not compute FK for %s", link_names[i].c_str());
       valid = false;
     }
   }
@@ -214,135 +222,104 @@ bool TRAC_IKKinematicsPlugin::getPositionFK(const std::vector<std::string> &link
   return valid;
 }
 
-
-bool TRAC_IKKinematicsPlugin::getPositionIK(const geometry_msgs::Pose &ik_pose,
-    const std::vector<double> &ik_seed_state,
-    std::vector<double> &solution,
-    moveit_msgs::MoveItErrorCodes &error_code,
-    const kinematics::KinematicsQueryOptions &options) const
+bool TRAC_IKKinematicsPlugin::getPositionIK(const geometry_msgs::msg::Pose& ik_pose,
+                                            const std::vector<double>& ik_seed_state,
+                                            std::vector<double>& solution,
+                                            moveit_msgs::msg::MoveItErrorCodes& error_code,
+                                            const kinematics::KinematicsQueryOptions& options) const
 {
-  const IKCallbackFn solution_callback = 0;
+  const IKCallbackFn solution_callback = nullptr;
   std::vector<double> consistency_limits;
 
-  return searchPositionIK(ik_pose,
-                          ik_seed_state,
-                          default_timeout_,
-                          solution,
-                          solution_callback,
-                          error_code,
-                          consistency_limits,
-                          options);
+  return searchPositionIK(ik_pose, ik_seed_state, default_timeout_, solution, solution_callback,
+                          error_code, consistency_limits, options);
 }
 
-bool TRAC_IKKinematicsPlugin::searchPositionIK(const geometry_msgs::Pose &ik_pose,
-    const std::vector<double> &ik_seed_state,
-    double timeout,
-    std::vector<double> &solution,
-    moveit_msgs::MoveItErrorCodes &error_code,
-    const kinematics::KinematicsQueryOptions &options) const
+bool TRAC_IKKinematicsPlugin::searchPositionIK(const geometry_msgs::msg::Pose& ik_pose,
+                                               const std::vector<double>& ik_seed_state,
+                                               double timeout,
+                                               std::vector<double>& solution,
+                                               moveit_msgs::msg::MoveItErrorCodes& error_code,
+                                               const kinematics::KinematicsQueryOptions& options) const
 {
-  const IKCallbackFn solution_callback = 0;
+  const IKCallbackFn solution_callback = nullptr;
   std::vector<double> consistency_limits;
 
-  return searchPositionIK(ik_pose,
-                          ik_seed_state,
-                          timeout,
-                          solution,
-                          solution_callback,
-                          error_code,
-                          consistency_limits,
-                          options);
+  return searchPositionIK(ik_pose, ik_seed_state, timeout, solution, solution_callback, error_code,
+                          consistency_limits, options);
 }
 
-bool TRAC_IKKinematicsPlugin::searchPositionIK(const geometry_msgs::Pose &ik_pose,
-    const std::vector<double> &ik_seed_state,
-    double timeout,
-    const std::vector<double> &consistency_limits,
-    std::vector<double> &solution,
-    moveit_msgs::MoveItErrorCodes &error_code,
-    const kinematics::KinematicsQueryOptions &options) const
+bool TRAC_IKKinematicsPlugin::searchPositionIK(const geometry_msgs::msg::Pose& ik_pose,
+                                               const std::vector<double>& ik_seed_state,
+                                               double timeout,
+                                               const std::vector<double>& consistency_limits,
+                                               std::vector<double>& solution,
+                                               moveit_msgs::msg::MoveItErrorCodes& error_code,
+                                               const kinematics::KinematicsQueryOptions& options) const
 {
-  const IKCallbackFn solution_callback = 0;
-  return searchPositionIK(ik_pose,
-                          ik_seed_state,
-                          timeout,
-                          solution,
-                          solution_callback,
-                          error_code,
-                          consistency_limits,
-                          options);
+  const IKCallbackFn solution_callback = nullptr;
+  return searchPositionIK(ik_pose, ik_seed_state, timeout, solution, solution_callback, error_code,
+                          consistency_limits, options);
 }
 
-bool TRAC_IKKinematicsPlugin::searchPositionIK(const geometry_msgs::Pose &ik_pose,
-    const std::vector<double> &ik_seed_state,
-    double timeout,
-    std::vector<double> &solution,
-    const IKCallbackFn &solution_callback,
-    moveit_msgs::MoveItErrorCodes &error_code,
-    const kinematics::KinematicsQueryOptions &options) const
+bool TRAC_IKKinematicsPlugin::searchPositionIK(const geometry_msgs::msg::Pose& ik_pose,
+                                               const std::vector<double>& ik_seed_state,
+                                               double timeout,
+                                               std::vector<double>& solution,
+                                               const IKCallbackFn& solution_callback,
+                                               moveit_msgs::msg::MoveItErrorCodes& error_code,
+                                               const kinematics::KinematicsQueryOptions& options) const
 {
   std::vector<double> consistency_limits;
-  return searchPositionIK(ik_pose,
-                          ik_seed_state,
-                          timeout,
-                          solution,
-                          solution_callback,
-                          error_code,
-                          consistency_limits,
-                          options);
+  return searchPositionIK(ik_pose, ik_seed_state, timeout, solution, solution_callback, error_code,
+                          consistency_limits, options);
 }
 
-bool TRAC_IKKinematicsPlugin::searchPositionIK(const geometry_msgs::Pose &ik_pose,
-    const std::vector<double> &ik_seed_state,
-    double timeout,
-    const std::vector<double> &consistency_limits,
-    std::vector<double> &solution,
-    const IKCallbackFn &solution_callback,
-    moveit_msgs::MoveItErrorCodes &error_code,
-    const kinematics::KinematicsQueryOptions &options) const
+bool TRAC_IKKinematicsPlugin::searchPositionIK(const geometry_msgs::msg::Pose& ik_pose,
+                                               const std::vector<double>& ik_seed_state,
+                                               double timeout,
+                                               const std::vector<double>& consistency_limits,
+                                               std::vector<double>& solution,
+                                               const IKCallbackFn& solution_callback,
+                                               moveit_msgs::msg::MoveItErrorCodes& error_code,
+                                               const kinematics::KinematicsQueryOptions& options) const
 {
-  return searchPositionIK(ik_pose,
-                          ik_seed_state,
-                          timeout,
-                          solution,
-                          solution_callback,
-                          error_code,
-                          consistency_limits,
-                          options);
+  return searchPositionIK(ik_pose, ik_seed_state, timeout, solution, solution_callback, error_code,
+                          consistency_limits, options);
 }
 
-bool TRAC_IKKinematicsPlugin::searchPositionIK(const geometry_msgs::Pose &ik_pose,
-    const std::vector<double> &ik_seed_state,
-    double timeout,
-    std::vector<double> &solution,
-    const IKCallbackFn &solution_callback,
-    moveit_msgs::MoveItErrorCodes &error_code,
-    const std::vector<double> &consistency_limits,
-    const kinematics::KinematicsQueryOptions &options) const
+bool TRAC_IKKinematicsPlugin::searchPositionIK(const geometry_msgs::msg::Pose& ik_pose,
+                                               const std::vector<double>& ik_seed_state,
+                                               double timeout,
+                                               std::vector<double>& solution,
+                                               const IKCallbackFn& solution_callback,
+                                               moveit_msgs::msg::MoveItErrorCodes& error_code,
+                                               const std::vector<double>& /*consistency_limits*/,
+                                               const kinematics::KinematicsQueryOptions& /*options*/) const
 {
-  ROS_DEBUG_STREAM_NAMED("trac_ik", "getPositionIK");
-
   if (!active_)
   {
-    ROS_ERROR("kinematics not active");
+    RCLCPP_ERROR(getLogger(), "kinematics not active");
     error_code.val = error_code.NO_IK_SOLUTION;
     return false;
   }
 
   if (ik_seed_state.size() != num_joints_)
   {
-    ROS_ERROR_STREAM_NAMED("trac_ik", "Seed state must have size " << num_joints_ << " instead of size " << ik_seed_state.size());
+    RCLCPP_ERROR(getLogger(), "Seed state must have size %u instead of size %zu", num_joints_,
+                 ik_seed_state.size());
     error_code.val = error_code.NO_IK_SOLUTION;
     return false;
   }
 
-  KDL::Frame frame;
-  tf::poseMsgToKDL(ik_pose, frame);
+  const KDL::Frame frame = poseMsgToKDL(ik_pose);
 
   KDL::JntArray in(num_joints_), out(num_joints_);
 
-  for (uint z = 0; z < num_joints_; z++)
+  for (unsigned int z = 0; z < num_joints_; z++)
+  {
     in(z) = ik_seed_state[z];
+  }
 
   KDL::Twist bounds = KDL::Twist::Zero();
 
@@ -353,64 +330,66 @@ bool TRAC_IKKinematicsPlugin::searchPositionIK(const geometry_msgs::Pose &ik_pos
     bounds.rot.z(std::numeric_limits<float>::max());
   }
 
-  double epsilon = 1e-5;  //Same as MoveIt's KDL plugin
-
   TRAC_IK::SolveType solvetype;
 
-  if (solve_type == "Manipulation1")
+  if (solve_type_ == "Manipulation1")
+  {
     solvetype = TRAC_IK::Manip1;
-  else if (solve_type == "Manipulation2")
+  }
+  else if (solve_type_ == "Manipulation2")
+  {
     solvetype = TRAC_IK::Manip2;
-  else if (solve_type == "Distance")
+  }
+  else if (solve_type_ == "Distance")
+  {
     solvetype = TRAC_IK::Distance;
+  }
   else
   {
-    if (solve_type != "Speed")
+    if (solve_type_ != "Speed")
     {
-      ROS_WARN_STREAM_NAMED("trac_ik", solve_type << " is not a valid solve_type; setting to default: Speed");
+      RCLCPP_WARN(getLogger(), "%s is not a valid solve_type; setting to default: Speed",
+                  solve_type_.c_str());
     }
     solvetype = TRAC_IK::Speed;
   }
 
-  TRAC_IK::TRAC_IK ik_solver(chain, joint_min, joint_max, timeout, epsilon, solvetype);
+  TRAC_IK::TRAC_IK ik_solver(chain_, joint_min_, joint_max_, timeout, epsilon_, solvetype);
 
-  int rc = ik_solver.CartToJnt(in, frame, out, bounds);
-
+  const int rc = ik_solver.CartToJnt(in, frame, out, bounds);
 
   solution.resize(num_joints_);
 
   if (rc >= 0)
   {
-    for (uint z = 0; z < num_joints_; z++)
+    for (unsigned int z = 0; z < num_joints_; z++)
+    {
       solution[z] = out(z);
+    }
 
     // check for collisions if a callback is provided
-    if (!solution_callback.empty())
+    if (solution_callback)
     {
       solution_callback(ik_pose, solution, error_code);
-      if (error_code.val == moveit_msgs::MoveItErrorCodes::SUCCESS)
+      if (error_code.val == moveit_msgs::msg::MoveItErrorCodes::SUCCESS)
       {
-        ROS_DEBUG_STREAM_NAMED("trac_ik", "Solution passes callback");
+        RCLCPP_DEBUG(getLogger(), "Solution passes callback");
         return true;
       }
-      else
-      {
-        ROS_DEBUG_STREAM_NAMED("trac_ik", "Solution has error code " << error_code);
-        return false;
-      }
+      RCLCPP_DEBUG(getLogger(), "Solution has error code %d", error_code.val);
+      return false;
     }
-    else
-      return true; // no collision check callback provided
+
+    error_code.val = moveit_msgs::msg::MoveItErrorCodes::SUCCESS;
+    return true;  // no collision check callback provided
   }
 
-  error_code.val = moveit_msgs::MoveItErrorCodes::NO_IK_SOLUTION;
+  error_code.val = moveit_msgs::msg::MoveItErrorCodes::NO_IK_SOLUTION;
   return false;
 }
 
+}  // namespace trac_ik_kinematics_plugin
 
-
-} // end namespace
-
-//register TRAC_IKKinematicsPlugin as a KinematicsBase implementation
-#include <pluginlib/class_list_macros.h>
+// register TRAC_IKKinematicsPlugin as a KinematicsBase implementation
+#include <pluginlib/class_list_macros.hpp>
 PLUGINLIB_EXPORT_CLASS(trac_ik_kinematics_plugin::TRAC_IKKinematicsPlugin, kinematics::KinematicsBase);
