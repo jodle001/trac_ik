@@ -183,9 +183,9 @@ int main(int argc, char ** argv)
   rclcpp::init(argc, argv);
   auto node = rclcpp::Node::make_shared("ik_tests");
 
-  int num_samples;
+  int num_samples = 0;
   std::string chain_start, chain_end, urdf_xml;
-  double timeout;
+  double timeout = 0.0;
 
   node->declare_parameter<int>("num_samples", 1000);
   node->declare_parameter<double>("timeout", 0.005);

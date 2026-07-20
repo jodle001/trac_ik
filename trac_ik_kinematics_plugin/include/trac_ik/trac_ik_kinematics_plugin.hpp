@@ -66,6 +66,27 @@ class TRAC_IKKinematicsPlugin : public kinematics::KinematicsBase
   std::string solve_type_{"Speed"};
   double epsilon_{1e-5};
 
+  // KinematicsBase::lookupParam was removed from MoveIt post-Humble; this is
+  // the same lookup order (group-scoped first, then bare, each with and
+  // without the robot_description_kinematics prefix).
+  template <typename T>
+  bool lookupParam(const rclcpp::Node::SharedPtr& node, const std::string& param, T& val,
+                   const T& default_val) const
+  {
+    for (const std::string& name :
+         { group_name_ + "." + param, param, "robot_description_kinematics." + group_name_ + "." + param,
+           "robot_description_kinematics." + param })
+    {
+      if (node->has_parameter(name))
+      {
+        node->get_parameter(name, val);
+        return true;
+      }
+    }
+    val = default_val;
+    return false;
+  }
+
 public:
   const std::vector<std::string>& getJointNames() const override
   {
